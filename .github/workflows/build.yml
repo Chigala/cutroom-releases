@@ -1,0 +1,237 @@
+# Cutroom's installers, built here because this repository is public (its runners are free and unlimited)
+# and the code lives in a private one. Run it by hand (Actions -> Build installers -> Run workflow) with the
+# tag to build, like v0.1.0: it checks that tag out of the private repository with the SOURCE_TOKEN secret
+# (a fine-grained token with read-only Contents access to it), builds macOS (Apple silicon and Intel),
+# Windows and Linux, self-tests each, and drafts a release here with the files installed copies update
+# from (latest*.yml). Publishing the draft is what releases it.
+#
+# Only runs by hand, by someone who can write to this repository: nothing here runs for a fork or a pull
+# request, and the token never reaches one. The build's logs are public: they hold file names and tool
+# output, never the code.
+#
+# Variables (not secrets): VEDIT_JEV_URL and VEDIT_AUTH_URL, the app's servers.
+# Signing switches on by itself once its secrets exist; until then the builds are unsigned.
+name: Build installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag of the private repository to build (v0.1.0, matching apps/desktop/package.json)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple silicon)
+            # Xcode 16: the newest Vision requests (the tools still run on macOS 13.3+, see bundle-tools.mts).
+            os: macos-15
+            arch: arm64
+            args: --mac --arm64
+            # The .zip and its .blockmap are what installed copies update from; latest-mac.yml names them.
+            files: |
+              apps/desktop/release/*.dmg
+              apps/desktop/release/*.zip
+              apps/desktop/release/*.blockmap
+              apps/desktop/release/*.yml
+              !apps/desktop/release/builder-debug.yml
+          - name: macOS (Intel)
+            # Built for x64 on the same runner (the tools cross-compile), and self-tested under Rosetta.
+            os: macos-15
+            arch: x64
+            args: --mac --x64
+            files: |
+              apps/desktop/release/*.dmg
+              apps/desktop/release/*.zip
+              apps/desktop/release/*.blockmap
+              apps/desktop/release/*.yml
+              !apps/desktop/release/builder-debug.yml
+          - name: Windows (x64)
+            os: windows-2022
+            arch: x64
+            args: --win --x64
+            files: |
+              apps/desktop/release/*.exe
+              apps/desktop/release/*.blockmap
+              apps/desktop/release/*.yml
+              !apps/desktop/release/builder-debug.yml
+          - name: Linux (x64)
+            # The oldest supported Ubuntu: what's built here runs on newer systems, not the other way round.
+            os: ubuntu-22.04
+            arch: x64
+            args: --linux --x64
+            files: |
+              apps/desktop/release/*.AppImage
+              apps/desktop/release/*.deb
+              apps/desktop/release/*.yml
+              !apps/desktop/release/builder-debug.yml
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Chigala/cutroom
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Downloads and whisper.cpp's source, kept between runs so rebuilds are quick.
+      - uses: actions/cache@v4
+        with:
+          path: apps/desktop/.tmp/tools-cache
+          key: tools-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('apps/desktop/scripts/bundle-tools.mts', 'packages/media/src/whisper.ts', 'packages/media/src/clean.ts') }}
+
+      - name: Build the app
+        run: pnpm --filter @vedit/desktop build
+        env:
+          # Cutroom's Jev proxy (instant edits), baked into the app: a repository variable, not a secret
+          # (the key stays in the Worker). Unset, the app does without instant edits.
+          VEDIT_JEV_URL: ${{ vars.VEDIT_JEV_URL }}
+          # Cutroom's account server (apps/auth). Unset, the app has no accounts to sign in to.
+          VEDIT_AUTH_URL: ${{ vars.VEDIT_AUTH_URL }}
+      - name: Bundle ffmpeg, whisper and the voice cleaner
+        run: pnpm --filter @vedit/desktop tools --arch ${{ matrix.arch }}
+      - name: Stage the runtime packages
+        run: pnpm --filter @vedit/desktop runtime-deps --arch ${{ matrix.arch }}
+      - name: Package
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_TEXT: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+          AZURE_PUBLISHER_NAME: ${{ vars.AZURE_PUBLISHER_NAME }}
+        run: |
+          sign=()
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            if [ -n "$CSC_LINK" ]; then
+              echo "Signing with the Developer ID certificate"
+              if [ -n "$APPLE_API_KEY_TEXT" ]; then
+                # electron-builder wants the key as a file.
+                export APPLE_API_KEY="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
+                printf '%s' "$APPLE_API_KEY_TEXT" > "$APPLE_API_KEY"
+                sign+=(-c.mac.notarize=true)
+                echo "Notarizing with the App Store Connect API key"
+              fi
+            else
+              # Unsigned, but consistently ad-hoc signed so Gatekeeper's "Open Anyway" works.
+              export CSC_IDENTITY_AUTO_DISCOVERY=false
+              unset CSC_LINK CSC_KEY_PASSWORD
+              sign+=(-c.mac.identity=- -c.mac.hardenedRuntime=false)
+            fi
+          elif [ "$RUNNER_OS" = "Windows" ] && [ -n "$AZURE_SIGNING_ACCOUNT" ]; then
+            echo "Signing with Azure Trusted Signing"
+            sign+=(
+              "-c.win.azureSignOptions.endpoint=$AZURE_SIGNING_ENDPOINT"
+              "-c.win.azureSignOptions.codeSigningAccountName=$AZURE_SIGNING_ACCOUNT"
+              "-c.win.azureSignOptions.certificateProfileName=$AZURE_CERT_PROFILE"
+              "-c.win.azureSignOptions.publisherName=$AZURE_PUBLISHER_NAME"
+            )
+          else
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            unset CSC_LINK CSC_KEY_PASSWORD
+          fi
+          pnpm exec electron-builder --config electron-builder.yml --publish never ${{ matrix.args }} "${sign[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+
+      # The packaged app, started on its own system: its self-test (src/main/smoke.ts) imports a short
+      # clip, transcribes it, reads its picture, renders a scripted graphic, exports and opens the editor.
+      # It runs after the upload, so a failing build's installer is still there to look at.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/whisper
+          key: whisper-small.en-${{ runner.os }}
+      - name: Rosetta for the self-test (an Intel Mac build on Apple silicon)
+        if: runner.os == 'macOS' && matrix.arch == 'x64'
+        run: /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null || softwareupdate --install-rosetta --agree-to-license
+      - name: Screen for the self-test (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb libnss3 libgbm1 libasound2
+      - name: Self-test the packaged app
+        shell: bash
+        env:
+          VEDIT_SMOKE_WHISPER: small.en
+          VEDIT_WHISPER_DIR: ${{ runner.temp }}/whisper
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a node apps/desktop/scripts/smoke-run.mjs --arch ${{ matrix.arch }}
+          elif [ "$RUNNER_OS" = "macOS" ] && [ "${{ matrix.arch }}" = "x64" ]; then
+            # Under Rosetta, Chrome's first start (translated once, then cached) can outlast the
+            # renderer's wait for it: a second run starts it at once.
+            node apps/desktop/scripts/smoke-run.mjs --arch x64 || node apps/desktop/scripts/smoke-run.mjs --arch x64
+          else
+            node apps/desktop/scripts/smoke-run.mjs --arch ${{ matrix.arch }}
+          fi
+
+  # A draft release, in this repository (where installed copies look), of what every runner built, once all
+  # of them built and passed their self-test. Nothing reaches anyone until it's published by hand.
+  release:
+    name: Draft the release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Chigala/cutroom
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check the tag is the app's version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          version=$(node -p "require('./apps/desktop/package.json').version")
+          if [ "$TAG" != "v$version" ]; then
+            echo "The tag is $TAG but apps/desktop/package.json says $version" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Gather the files (one update manifest for both Macs)
+        run: node --experimental-strip-types apps/desktop/scripts/release-files.mts artifacts release
+      - name: Make or update the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          if gh release view "$TAG" --repo "$repo" > /dev/null 2>&1; then
+            gh release upload "$TAG" release/* --repo "$repo" --clobber
+          else
+            flags=(--draft --title "Cutroom ${TAG#v}" --notes "Cutroom ${TAG#v}")
+            # v0.3.0-beta.1 and the like are pre-releases: only the Beta channel takes them.
+            [[ "$TAG" == *-* ]] && flags+=(--prerelease)
+            gh release create "$TAG" release/* --repo "$repo" "${flags[@]}"
+          fi
