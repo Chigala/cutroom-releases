@@ -42,6 +42,7 @@ jobs:
               apps/desktop/release/*.zip
               apps/desktop/release/*.blockmap
               apps/desktop/release/*.yml
+              apps/desktop/release/notarization-*.txt
               !apps/desktop/release/builder-debug.yml
           - name: macOS (Intel)
             # Built for x64 on the same runner (the tools cross-compile), and self-tested under Rosetta.
@@ -53,6 +54,7 @@ jobs:
               apps/desktop/release/*.zip
               apps/desktop/release/*.blockmap
               apps/desktop/release/*.yml
+              apps/desktop/release/notarization-*.txt
               !apps/desktop/release/builder-debug.yml
           - name: Windows (x64)
             os: windows-2022
@@ -127,13 +129,8 @@ jobs:
           if [ "$RUNNER_OS" = "macOS" ]; then
             if [ -n "$CSC_LINK" ]; then
               echo "Signing with the Developer ID certificate"
-              if [ -n "$APPLE_API_KEY_TEXT" ]; then
-                # electron-builder wants the key as a file.
-                export APPLE_API_KEY="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
-                printf '%s' "$APPLE_API_KEY_TEXT" > "$APPLE_API_KEY"
-                sign+=(-c.mac.notarize=true)
-                echo "Notarizing with the App Store Connect API key"
-              fi
+              # Notarized in the next step, not by electron-builder: its wait gives up at the first
+              # dropped connection, and Apple can take hours.
             else
               # Unsigned, but consistently ad-hoc signed so Gatekeeper's "Open Anyway" works.
               export CSC_IDENTITY_AUTO_DISCOVERY=false
@@ -153,6 +150,38 @@ jobs:
             unset CSC_LINK CSC_KEY_PASSWORD
           fi
           pnpm exec electron-builder --config electron-builder.yml --publish never ${{ matrix.args }} "${sign[@]}"
+
+      # Apple's notarization, for a signed Mac build when there's an App Store Connect API key. Only the
+      # upload happens here: Apple can take minutes or, for a new account, days, more than a runner may
+      # wait. Its answer attaches to the app online (Gatekeeper looks the ticket up), so nothing here
+      # changes afterwards; the submission's id goes in the job summary and the draft's notes, and the
+      # draft is published once `xcrun notarytool info <id>` says Accepted.
+      - name: Send to Apple for notarization (macOS)
+        if: runner.os == 'macOS'
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          APPLE_API_KEY_TEXT: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [ -z "$CSC_LINK" ] || [ -z "$APPLE_API_KEY_TEXT" ]; then
+            echo "Not notarized: no Developer ID or no API key"
+            exit 0
+          fi
+          key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
+          printf '%s' "$APPLE_API_KEY_TEXT" > "$key"
+          zip=$(ls release/*.zip)
+          id=""
+          for try in 1 2 3 4 5; do
+            id=$(xcrun notarytool submit "$zip" --key "$key" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --no-wait --output-format json | jq -r '.id // empty') && [ -n "$id" ] && break
+            echo "Upload failed (try $try), retrying in 30s"; sleep 30
+          done
+          [ -n "$id" ] || { echo "Couldn't upload to Apple" >&2; exit 1; }
+          echo "Sent $(basename "$zip") to Apple: $id" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$(basename "$zip") $id" > release/notarization-${{ matrix.arch }}.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -220,7 +249,11 @@ jobs:
         with:
           path: artifacts
       - name: Gather the files (one update manifest for both Macs)
-        run: node --experimental-strip-types apps/desktop/scripts/release-files.mts artifacts release
+        run: |
+          # Apple's submission ids go in the draft's notes, not among its files.
+          find artifacts -name 'notarization-*.txt' -exec cat {} + > notarization.txt
+          find artifacts -name 'notarization-*.txt' -delete
+          node --experimental-strip-types apps/desktop/scripts/release-files.mts artifacts release
       - name: Make or update the draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -230,7 +263,11 @@ jobs:
           if gh release view "$TAG" --repo "$repo" > /dev/null 2>&1; then
             gh release upload "$TAG" release/* --repo "$repo" --clobber
           else
-            flags=(--draft --title "Cutroom ${TAG#v}" --notes "Cutroom ${TAG#v}")
+            notes="Cutroom ${TAG#v}"
+            if [ -s notarization.txt ]; then
+              notes+=$'\n\n<!-- Apple notarization (publish once each is Accepted): '"$(tr '\n' ';' < notarization.txt)"' -->'
+            fi
+            flags=(--draft --title "Cutroom ${TAG#v}" --notes "$notes")
             # v0.3.0-beta.1 and the like are pre-releases: only the Beta channel takes them.
             [[ "$TAG" == *-* ]] && flags+=(--prerelease)
             gh release create "$TAG" release/* --repo "$repo" "${flags[@]}"
